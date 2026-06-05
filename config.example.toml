@@ -1,0 +1,47 @@
+[microsoft]
+client_id = "YOUR_AZURE_APP_CLIENT_ID"
+tenant_id = "YOUR_AZURE_TENANT_ID"
+client_secret = "YOUR_AZURE_CLIENT_SECRET"
+
+[google]
+credentials_file = "credentials.json"
+
+[sync]
+# How many days ahead to sync
+lookahead_days = 14
+
+# Which response statuses to sync: "accepted", "tentativelyAccepted", "notResponded"
+# "declined" is excluded by default
+include_statuses = ["accepted"]
+
+# How often the sync runs (informational, actual schedule is via cron)
+poll_interval_minutes = 5
+
+# Google Calendar ID to sync into (use "primary" for your main calendar,
+# or create a dedicated "Work" calendar and use its ID)
+google_calendar_id = "primary"
+
+[colors]
+# Google Calendar color IDs:
+# 1=Lavender, 2=Sage, 3=Grape, 4=Flamingo, 5=Banana
+# 6=Tangerine, 7=Peacock, 8=Graphite, 9=Blueberry, 10=Basil, 11=Tomato
+#
+# Default color for synced events
+default = "9"  # Blueberry
+
+# Color overrides based on event properties
+# Format: field.operator = { value = "...", color = "..." }
+[[colors.rules]]
+field = "subject"
+contains = "standup"
+color = "8"  # Graphite (routine)
+
+[[colors.rules]]
+field = "subject"
+contains = "1:1"
+color = "7"  # Peacock (important)
+
+[[colors.rules]]
+field = "isAllDay"
+equals = true
+color = "5"  # Banana
