@@ -44,22 +44,30 @@ Syncs Microsoft 365 Outlook calendar events to Google Calendar with filtering an
 
 ```bash
 cd kvwu-calendar-sync
+uv sync
+```
+
+Or without uv:
+```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r <(uv pip compile pyproject.toml)
+```
+
+### 4. Configure & Authenticate
+
+```bash
 cp config.example.toml config.toml
 # Edit config.toml with your Client ID and Tenant ID
 ```
 
-### 4. Authenticate
-
 On a machine with a browser:
 ```bash
-python sync.py --auth
+uv run sync.py --auth
 ```
 
 On a headless Pi (no browser):
 ```bash
-python sync.py --auth --headless
+uv run sync.py --auth --headless
 ```
 
 The Microsoft flow will display a device code to enter at https://microsoft.com/devicelogin.
@@ -68,10 +76,10 @@ The Google flow (headless) will print a URL — open it on any machine, authoriz
 ### 5. Run
 
 ```bash
-python sync.py           # normal sync
-python sync.py --dry-run # preview what would sync
-python sync.py --verbose # debug output
-python sync.py --quiet   # only warnings/errors (good for cron)
+uv run sync.py           # normal sync
+uv run sync.py --dry-run # preview what would sync
+uv run sync.py --verbose # debug output
+uv run sync.py --quiet   # only warnings/errors (good for cron)
 ```
 
 ### 6. Cron (Raspberry Pi)
@@ -79,7 +87,7 @@ python sync.py --quiet   # only warnings/errors (good for cron)
 ```bash
 crontab -e
 # Add:
-*/5 * * * * cd /home/pi/kvwu-calendar-sync && .venv/bin/python sync.py --quiet >> /var/log/calendar-sync.log 2>&1
+*/5 * * * * cd /home/pi/kvwu-calendar-sync && uv run sync.py --quiet >> /var/log/calendar-sync.log 2>&1
 ```
 
 ## Configuration

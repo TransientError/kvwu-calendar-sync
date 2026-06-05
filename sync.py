@@ -15,10 +15,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+import tomllib
 
 import httpx
 import msal
