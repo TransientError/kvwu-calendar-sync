@@ -7,7 +7,7 @@ credentials_file = "credentials.json"
 
 [sync]
 # How many days ahead to sync
-lookahead_days = 14
+lookahead_days = 180
 
 # Which response statuses to sync: "accepted", "tentativelyAccepted", "notResponded"
 # "declined" is excluded by default
