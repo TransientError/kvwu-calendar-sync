@@ -246,19 +246,30 @@ def fetch_outlook_events(token: str, config: dict) -> list[dict]:
 
 
 def filter_events(events: list[dict], config: dict) -> list[dict]:
-    """Filter events by response status and optionally by showAs."""
+    """Filter events by response status and optionally by showAs.
+
+    Events matching an 'always_sync' subject pattern bypass the status filter.
+    """
     include_statuses = set(config["sync"]["include_statuses"])
     include_show_as = config["sync"].get("include_show_as")
     if include_show_as:
         include_show_as = set(include_show_as)
 
+    always_sync_patterns = [p.lower() for p in config["sync"].get("always_sync_subjects", [])]
+
     filtered = []
     for event in events:
         if event.get("isCancelled"):
             continue
-        status = event.get("responseStatus", {}).get("response", "none")
-        if status not in include_statuses:
-            continue
+
+        subject = event.get("subject", "").lower()
+        bypass_status = any(pattern in subject for pattern in always_sync_patterns)
+
+        if not bypass_status:
+            status = event.get("responseStatus", {}).get("response", "none")
+            if status not in include_statuses:
+                continue
+
         if include_show_as and event.get("showAs", "").lower() not in include_show_as:
             continue
         filtered.append(event)

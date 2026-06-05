@@ -13,6 +13,10 @@ lookahead_days = 180
 # "declined" is excluded by default
 include_statuses = ["accepted"]
 
+# Subjects that always sync regardless of response status (case-insensitive substring match).
+# Useful for on-call schedules you haven't accepted yet but need visibility on.
+always_sync_subjects = ["on-call"]
+
 # Which showAs values to include (empty = all): "busy", "tentative", "free", "oof", "workingElsewhere"
 # include_show_as = ["busy", "oof", "workingElsewhere"]
 
