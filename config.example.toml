@@ -32,26 +32,25 @@ max_attempts = 3
 initial_wait = 2
 
 [colors]
-# Google Calendar color IDs:
-# 1=Lavender, 2=Sage, 3=Grape, 4=Flamingo, 5=Banana
-# 6=Tangerine, 7=Peacock, 8=Graphite, 9=Blueberry, 10=Basil, 11=Tomato
-#
 # Default color for synced events
-default = "9"  # Blueberry
+default = "blueberry"
+
+# Available colors:
+# lavender, sage, grape, flamingo, banana,
+# tangerine, peacock, graphite, blueberry, basil, tomato
 
 # Color overrides based on event properties
-# Format: field.operator = { value = "...", color = "..." }
 [[colors.rules]]
 field = "subject"
 contains = "standup"
-color = "8"  # Graphite (routine)
+color = "graphite"
 
 [[colors.rules]]
 field = "subject"
 contains = "1:1"
-color = "7"  # Peacock (important)
+color = "peacock"
 
 [[colors.rules]]
 field = "isAllDay"
 equals = true
-color = "5"  # Banana
+color = "banana"

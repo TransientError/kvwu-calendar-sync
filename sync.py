@@ -39,6 +39,31 @@ GOOGLE_TOKEN_PATH = BASE_DIR / "google_token.json"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+# Google Calendar color name → ID mapping
+GOOGLE_COLORS = {
+    "lavender": "1",
+    "sage": "2",
+    "grape": "3",
+    "flamingo": "4",
+    "banana": "5",
+    "tangerine": "6",
+    "peacock": "7",
+    "graphite": "8",
+    "blueberry": "9",
+    "basil": "10",
+    "tomato": "11",
+}
+
+
+def resolve_color(value: str) -> str:
+    """Resolve a color name or numeric ID to a Google Calendar color ID."""
+    if value in GOOGLE_COLORS:
+        return GOOGLE_COLORS[value]
+    if value in GOOGLE_COLORS.values():
+        return value
+    valid = ", ".join(GOOGLE_COLORS.keys())
+    raise ValueError(f"Unknown color '{value}'. Valid options: {valid}")
+
 
 class AuthExpiredError(Exception):
     """Raised when a token is expired/revoked and interactive re-auth is needed."""
@@ -252,12 +277,12 @@ def determine_color(event: dict, config: dict) -> str:
 
         if "contains" in rule:
             if isinstance(value, str) and rule["contains"].lower() in value.lower():
-                return str(rule["color"])
+                return resolve_color(str(rule["color"]))
         elif "equals" in rule:
             if value == rule["equals"]:
-                return str(rule["color"])
+                return resolve_color(str(rule["color"]))
 
-    return str(config.get("colors", {}).get("default", "9"))
+    return resolve_color(str(config.get("colors", {}).get("default", "blueberry")))
 
 
 # ─── Google Calendar Sync ────────────────────────────────────────────────────
