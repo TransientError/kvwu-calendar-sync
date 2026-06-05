@@ -5,42 +5,43 @@ Polls Microsoft Graph API for calendar events, filters by response status,
 and pushes them to Google Calendar with color-coding.
 """
 
+import os
 import sys
 import json
 import hashlib
 import logging
 import argparse
+import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+import tomllib
 
 import httpx
 import msal
+from filelock import FileLock, Timeout
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.toml"
 STATE_PATH = BASE_DIR / "state.json"
+LOCK_PATH = BASE_DIR / ".sync.lock"
 MS_TOKEN_PATH = BASE_DIR / "ms_token_cache.json"
 GOOGLE_TOKEN_PATH = BASE_DIR / "google_token.json"
-GOOGLE_CREDS_PATH = BASE_DIR / "credentials.json"
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+
+class AuthExpiredError(Exception):
+    """Raised when a token is expired/revoked and interactive re-auth is needed."""
 
 
 def load_config() -> dict:
@@ -55,14 +56,35 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+    """Atomically write state to disk via temp file + rename."""
+    fd, tmp_path = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp_path, STATE_PATH)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+
+
+def _retry_config(config: dict):
+    """Build tenacity retry kwargs from config."""
+    retry_cfg = config.get("retry", {})
+    max_attempts = retry_cfg.get("max_attempts", 3)
+    initial_wait = retry_cfg.get("initial_wait", 2)
+    return {
+        "stop": stop_after_attempt(max_attempts),
+        "wait": wait_exponential(multiplier=initial_wait, min=initial_wait, max=30),
+        "retry": retry_if_exception_type((httpx.HTTPStatusError, httpx.TransportError, HttpError)),
+        "reraise": True,
+    }
 
 
 # ─── Microsoft Graph Auth ────────────────────────────────────────────────────
 
 
 def get_ms_token(config: dict) -> str:
-    """Get a valid Microsoft Graph access token using MSAL with device code or cached refresh token."""
+    """Get a valid Microsoft Graph access token using MSAL device code flow."""
     cache = msal.SerializableTokenCache()
     if MS_TOKEN_PATH.exists():
         cache.deserialize(MS_TOKEN_PATH.read_text())
@@ -82,8 +104,13 @@ def get_ms_token(config: dict) -> str:
         if result and "access_token" in result:
             _save_ms_cache(cache)
             return result["access_token"]
+        if result and "error" in result:
+            raise AuthExpiredError(
+                f"Microsoft token expired or revoked: {result.get('error_description', result['error'])}. "
+                "Re-run with --auth to re-authenticate."
+            )
 
-    # Interactive auth needed
+    # Interactive device code auth
     flow = app.initiate_device_flow(
         scopes=["https://graph.microsoft.com/Calendars.Read"]
     )
@@ -91,7 +118,7 @@ def get_ms_token(config: dict) -> str:
         raise RuntimeError(f"Failed to create device flow: {flow}")
 
     print(f"\n{'='*60}")
-    print(f"Microsoft sign-in required.")
+    print("Microsoft sign-in required.")
     print(f"Go to: {flow['verification_uri']}")
     print(f"Enter code: {flow['user_code']}")
     print(f"{'='*60}\n")
@@ -112,25 +139,40 @@ def _save_ms_cache(cache: msal.SerializableTokenCache):
 # ─── Google Calendar Auth ────────────────────────────────────────────────────
 
 
-def get_google_service(config: dict):
-    """Get an authenticated Google Calendar service."""
-    creds = None
+def get_google_service(config: dict, headless: bool = False):
+    """Get an authenticated Google Calendar service.
 
+    Args:
+        headless: If True, use console-based OAuth (no browser needed).
+    """
+    creds_path = Path(config.get("google", {}).get("credentials_file", "credentials.json"))
+    if not creds_path.is_absolute():
+        creds_path = BASE_DIR / creds_path
+
+    creds = None
     if GOOGLE_TOKEN_PATH.exists():
         creds = Credentials.from_authorized_user_file(str(GOOGLE_TOKEN_PATH), GOOGLE_SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                raise AuthExpiredError(
+                    f"Google token refresh failed: {e}. Re-run with --auth to re-authenticate."
+                )
         else:
-            if not GOOGLE_CREDS_PATH.exists():
+            if not creds_path.exists():
                 raise FileNotFoundError(
-                    f"Missing {GOOGLE_CREDS_PATH}. Download from Google Cloud Console."
+                    f"Missing {creds_path}. Download from Google Cloud Console."
                 )
             flow = InstalledAppFlow.from_client_secrets_file(
-                str(GOOGLE_CREDS_PATH), GOOGLE_SCOPES
+                str(creds_path), GOOGLE_SCOPES
             )
-            creds = flow.run_local_server(port=8401)
+            if headless:
+                creds = flow.run_console()
+            else:
+                creds = flow.run_local_server(port=8401)
 
         GOOGLE_TOKEN_PATH.write_text(creds.to_json())
 
@@ -156,11 +198,21 @@ def fetch_outlook_events(token: str, config: dict) -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
     events = []
 
+    retry_kwargs = _retry_config(config)
+
+    @retry(**retry_kwargs)
+    def _fetch_page(url, req_params):
+        resp = httpx.get(url, headers=headers, params=req_params, timeout=30)
+        if resp.status_code == 401:
+            raise AuthExpiredError(
+                "Microsoft token rejected (401). Re-run with --auth to re-authenticate."
+            )
+        resp.raise_for_status()
+        return resp.json()
+
     url = f"{GRAPH_BASE}/me/calendarView"
     while url:
-        resp = httpx.get(url, headers=headers, params=params)
-        resp.raise_for_status()
-        data = resp.json()
+        data = _fetch_page(url, params)
         events.extend(data.get("value", []))
         url = data.get("@odata.nextLink")
         params = None  # nextLink includes params
@@ -169,15 +221,22 @@ def fetch_outlook_events(token: str, config: dict) -> list[dict]:
 
 
 def filter_events(events: list[dict], config: dict) -> list[dict]:
-    """Filter events by response status."""
-    include = set(config["sync"]["include_statuses"])
+    """Filter events by response status and optionally by showAs."""
+    include_statuses = set(config["sync"]["include_statuses"])
+    include_show_as = config["sync"].get("include_show_as")
+    if include_show_as:
+        include_show_as = set(include_show_as)
+
     filtered = []
     for event in events:
         if event.get("isCancelled"):
             continue
         status = event.get("responseStatus", {}).get("response", "none")
-        if status in include:
-            filtered.append(event)
+        if status not in include_statuses:
+            continue
+        if include_show_as and event.get("showAs", "").lower() not in include_show_as:
+            continue
+        filtered.append(event)
     return filtered
 
 
@@ -222,13 +281,31 @@ def sync_to_google(events: list[dict], config: dict, service, state: dict) -> di
     calendar_id = config["sync"]["google_calendar_id"]
     synced = state.get("synced_events", {})
     current_event_ids = set()
+    retry_kwargs = _retry_config(config)
+
+    @retry(**retry_kwargs)
+    def _insert(body):
+        return service.events().insert(calendarId=calendar_id, body=body).execute()
+
+    @retry(**retry_kwargs)
+    def _update(event_id, body):
+        return service.events().update(calendarId=calendar_id, eventId=event_id, body=body).execute()
+
+    @retry(**retry_kwargs)
+    def _delete(event_id):
+        try:
+            service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+        except HttpError as e:
+            if e.resp.status == 404 or e.resp.status == 410:
+                pass  # Already deleted
+            else:
+                raise
 
     for event in events:
         outlook_id = event["id"]
         current_event_ids.add(outlook_id)
         fingerprint = event_fingerprint(event)
 
-        # Check if already synced and unchanged
         if outlook_id in synced and synced[outlook_id].get("fingerprint") == fingerprint:
             continue
 
@@ -236,38 +313,29 @@ def sync_to_google(events: list[dict], config: dict, service, state: dict) -> di
         google_event = _build_google_event(event, color)
 
         if outlook_id in synced and synced[outlook_id].get("google_id"):
-            # Update existing
             try:
-                service.events().update(
-                    calendarId=calendar_id,
-                    eventId=synced[outlook_id]["google_id"],
-                    body=google_event,
-                ).execute()
+                _update(synced[outlook_id]["google_id"], google_event)
                 log.info(f"Updated: {event.get('subject', 'No subject')}")
+                synced[outlook_id] = {
+                    "google_id": synced[outlook_id]["google_id"],
+                    "fingerprint": fingerprint,
+                }
             except Exception as e:
                 log.warning(f"Update failed, recreating: {e}")
-                _delete_google_event(service, calendar_id, synced[outlook_id]["google_id"])
-                google_id = _create_google_event(service, calendar_id, google_event)
-                synced[outlook_id] = {"google_id": google_id, "fingerprint": fingerprint}
-                continue
+                _delete(synced[outlook_id]["google_id"])
+                result = _insert(google_event)
+                synced[outlook_id] = {"google_id": result["id"], "fingerprint": fingerprint}
         else:
-            # Create new
-            google_id = _create_google_event(service, calendar_id, google_event)
+            result = _insert(google_event)
             log.info(f"Created: {event.get('subject', 'No subject')}")
-            synced[outlook_id] = {"google_id": google_id, "fingerprint": fingerprint}
-            continue
-
-        synced[outlook_id] = {
-            "google_id": synced[outlook_id]["google_id"],
-            "fingerprint": fingerprint,
-        }
+            synced[outlook_id] = {"google_id": result["id"], "fingerprint": fingerprint}
 
     # Remove events no longer in Outlook
     stale_ids = set(synced.keys()) - current_event_ids
     for outlook_id in stale_ids:
         google_id = synced[outlook_id].get("google_id")
         if google_id:
-            _delete_google_event(service, calendar_id, google_id)
+            _delete(google_id)
             log.info(f"Deleted stale event: {google_id}")
         del synced[outlook_id]
 
@@ -295,7 +363,6 @@ def _build_google_event(event: dict, color: str) -> dict:
         google_event["location"] = location
 
     if event.get("isAllDay"):
-        # All-day events use date, not dateTime
         google_event["start"] = {"date": start["dateTime"][:10]}
         google_event["end"] = {"date": end["dateTime"][:10]}
     else:
@@ -305,29 +372,17 @@ def _build_google_event(event: dict, color: str) -> dict:
     return google_event
 
 
-def _create_google_event(service, calendar_id: str, body: dict) -> str:
-    result = service.events().insert(calendarId=calendar_id, body=body).execute()
-    return result["id"]
-
-
-def _delete_google_event(service, calendar_id: str, event_id: str):
-    try:
-        service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
-    except Exception:
-        pass  # Already deleted or not found
-
-
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
-def run_auth(config: dict):
+def run_auth(config: dict, headless: bool = False):
     """Run interactive auth flows for both services."""
     log.info("Authenticating with Microsoft...")
     get_ms_token(config)
     log.info("Microsoft auth successful!")
 
     log.info("Authenticating with Google...")
-    get_google_service(config)
+    get_google_service(config, headless=headless)
     log.info("Google auth successful!")
 
     log.info("All tokens saved. You can now run sync via cron.")
@@ -355,8 +410,26 @@ def run_sync(config: dict):
 def main():
     parser = argparse.ArgumentParser(description="Sync Outlook calendar to Google Calendar")
     parser.add_argument("--auth", action="store_true", help="Run interactive authentication")
+    parser.add_argument("--headless", action="store_true",
+                        help="Use console-based Google OAuth (no browser, for headless Pi)")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and filter but don't push to Google")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("--quiet", action="store_true", help="Only show warnings and errors")
     args = parser.parse_args()
+
+    # Configure logging level
+    if args.verbose:
+        level = logging.DEBUG
+    elif args.quiet:
+        level = logging.WARNING
+    else:
+        level = logging.INFO
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     if not CONFIG_PATH.exists():
         log.error(f"Config not found: {CONFIG_PATH}")
@@ -366,18 +439,30 @@ def main():
     config = load_config()
 
     if args.auth:
-        run_auth(config)
-    elif args.dry_run:
-        token = get_ms_token(config)
-        events = fetch_outlook_events(token, config)
-        filtered = filter_events(events, config)
-        log.info(f"Would sync {len(filtered)} events:")
-        for e in filtered:
-            color = determine_color(e, config)
-            log.info(f"  [{color}] {e.get('subject', 'No subject')} "
-                     f"({e['start']['dateTime'][:16]})")
-    else:
-        run_sync(config)
+        run_auth(config, headless=args.headless)
+        return
+
+    # Acquire lock to prevent overlapping runs
+    lock = FileLock(LOCK_PATH, timeout=10)
+    try:
+        with lock:
+            if args.dry_run:
+                token = get_ms_token(config)
+                events = fetch_outlook_events(token, config)
+                filtered = filter_events(events, config)
+                log.info(f"Would sync {len(filtered)} events:")
+                for e in filtered:
+                    color = determine_color(e, config)
+                    log.info(f"  [{color}] {e.get('subject', 'No subject')} "
+                             f"({e['start']['dateTime'][:16]})")
+            else:
+                run_sync(config)
+    except Timeout:
+        log.warning("Another sync is already running. Skipping.")
+        sys.exit(0)
+    except AuthExpiredError as e:
+        log.error(str(e))
+        sys.exit(2)
 
 
 if __name__ == "__main__":

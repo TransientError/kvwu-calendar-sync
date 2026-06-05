@@ -1,7 +1,6 @@
 [microsoft]
 client_id = "YOUR_AZURE_APP_CLIENT_ID"
 tenant_id = "YOUR_AZURE_TENANT_ID"
-client_secret = "YOUR_AZURE_CLIENT_SECRET"
 
 [google]
 credentials_file = "credentials.json"
@@ -14,12 +13,21 @@ lookahead_days = 14
 # "declined" is excluded by default
 include_statuses = ["accepted"]
 
+# Which showAs values to include (empty = all): "busy", "tentative", "free", "oof", "workingElsewhere"
+# include_show_as = ["busy", "oof", "workingElsewhere"]
+
 # How often the sync runs (informational, actual schedule is via cron)
 poll_interval_minutes = 5
 
 # Google Calendar ID to sync into (use "primary" for your main calendar,
 # or create a dedicated "Work" calendar and use its ID)
 google_calendar_id = "primary"
+
+[retry]
+# Max retries for API calls (uses exponential backoff)
+max_attempts = 3
+# Initial wait between retries in seconds
+initial_wait = 2
 
 [colors]
 # Google Calendar color IDs:
