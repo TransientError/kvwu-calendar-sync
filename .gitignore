@@ -4,6 +4,7 @@ credentials.json
 google_token.json
 ms_token_cache.json
 state.json
+.sync.lock
 
 # Python
 __pycache__/
