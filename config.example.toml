@@ -33,7 +33,7 @@ initial_wait = 2
 
 [colors]
 # Default color for synced events
-default = "blueberry"
+default = "sage"
 
 # Available colors (lowercase only):
 # lavender, sage, grape, flamingo, banana,
