@@ -215,7 +215,7 @@ def fetch_outlook_events(token: str, config: dict) -> list[dict]:
     params = {
         "startDateTime": now.isoformat(),
         "endDateTime": end.isoformat(),
-        "$select": "id,subject,start,end,isAllDay,isCancelled,responseStatus,location,showAs",
+        "$select": "id,subject,start,end,isAllDay,isCancelled,responseStatus,location,showAs,organizer,attendees,isOrganizer",
         "$top": 200,
         "$orderby": "start/dateTime",
     }
@@ -249,6 +249,7 @@ def filter_events(events: list[dict], config: dict) -> list[dict]:
     """Filter events by response status and optionally by showAs.
 
     Events matching an 'always_sync' subject pattern bypass the status filter.
+    Solo time blocks (organizer == you, no other attendees) are skipped.
     """
     include_statuses = set(config["sync"]["include_statuses"])
     include_show_as = config["sync"].get("include_show_as")
@@ -256,10 +257,16 @@ def filter_events(events: list[dict], config: dict) -> list[dict]:
         include_show_as = set(include_show_as)
 
     always_sync_patterns = [p.lower() for p in config["sync"].get("always_sync_subjects", [])]
+    skip_solo = config["sync"].get("skip_solo_events", True)
 
     filtered = []
     for event in events:
         if event.get("isCancelled"):
+            continue
+
+        # Skip self-created time blocks with no other attendees
+        if skip_solo and _is_solo_event(event):
+            log.debug(f"Skipping solo event: {event.get('subject', 'No subject')}")
             continue
 
         subject = event.get("subject", "").lower()
@@ -274,6 +281,14 @@ def filter_events(events: list[dict], config: dict) -> list[dict]:
             continue
         filtered.append(event)
     return filtered
+
+
+def _is_solo_event(event: dict) -> bool:
+    """Check if event is a self-created time block (organizer, no other attendees)."""
+    if not event.get("isOrganizer"):
+        return False
+    attendees = event.get("attendees", [])
+    return len(attendees) == 0
 
 
 # ─── Color Mapping ───────────────────────────────────────────────────────────

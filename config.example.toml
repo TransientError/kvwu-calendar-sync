@@ -17,6 +17,9 @@ include_statuses = ["accepted"]
 # Useful for on-call schedules you haven't accepted yet but need visibility on.
 always_sync_subjects = ["on-call"]
 
+# Skip events you created for yourself with no other attendees (time blocks, commute, lunch).
+skip_solo_events = true
+
 # Which showAs values to include (empty = all): "busy", "tentative", "free", "oof", "workingElsewhere"
 # include_show_as = ["busy", "oof", "workingElsewhere"]
 
