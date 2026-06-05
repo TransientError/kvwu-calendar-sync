@@ -438,6 +438,13 @@ def main():
 
     config = load_config()
 
+    calendar_id = config.get("sync", {}).get("google_calendar_id", "")
+    if not calendar_id or calendar_id == "primary":
+        log.error("google_calendar_id is not set (or is 'primary').")
+        log.error("Create a dedicated Google Calendar and set its ID in config.toml.")
+        log.error("Find it: Google Calendar → Settings → <calendar> → Integrate calendar → Calendar ID")
+        sys.exit(1)
+
     if args.auth:
         run_auth(config, headless=args.headless)
         return

@@ -19,9 +19,11 @@ include_statuses = ["accepted"]
 # How often the sync runs (informational, actual schedule is via cron)
 poll_interval_minutes = 5
 
-# Google Calendar ID to sync into (use "primary" for your main calendar,
-# or create a dedicated "Work" calendar and use its ID)
-google_calendar_id = "primary"
+# Google Calendar ID to sync into.
+# Create a dedicated calendar (e.g., "Work") and paste its ID here.
+# Find it in Google Calendar → Settings → <calendar> → "Integrate calendar" → Calendar ID.
+# DO NOT use "primary" unless you want work events mixed into your personal calendar.
+google_calendar_id = ""
 
 [retry]
 # Max retries for API calls (uses exponential backoff)
