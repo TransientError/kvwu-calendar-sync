@@ -282,9 +282,12 @@ def fetch_ics_events(config: dict) -> list[dict]:
 
     raw = _fetch_ics()
     cal = icalendar.Calendar.from_ical(raw)
-    events = []
-    # Track which expanded instances exist (to avoid duplicates with RRULE expansion)
-    seen_ids = set()
+
+    # Two-pass: first collect RRULE-expanded events, then let standalone
+    # instances (with RECURRENCE-ID) override them. This handles the case
+    # where a single instance of a recurring series has different status
+    # (e.g., accepted one instance of a mostly-declined series).
+    events_by_id: dict[str, dict] = {}
 
     for component in cal.walk():
         if component.name != "VEVENT":
@@ -292,12 +295,10 @@ def fetch_ics_events(config: dict) -> list[dict]:
 
         rrule = component.get("RRULE")
         if rrule:
-            # Expand recurring events into the sync window
             expanded = _expand_rrule_events(component, user_email, now, end)
             for event in expanded:
-                if event["id"] not in seen_ids:
-                    seen_ids.add(event["id"])
-                    events.append(event)
+                if event["id"] not in events_by_id:
+                    events_by_id[event["id"]] = event
         else:
             event = _ics_vevent_to_dict(component, user_email)
             if event is None:
@@ -313,10 +314,10 @@ def fetch_ics_events(config: dict) -> list[dict]:
             if ev_start > end:
                 continue
 
-            if event["id"] not in seen_ids:
-                seen_ids.add(event["id"])
-                events.append(event)
+            # Standalone instances override RRULE-expanded ones
+            events_by_id[event["id"]] = event
 
+    events = list(events_by_id.values())
     log.debug(f"ICS feed parsed: {len(events)} events in sync window")
     return events
 
