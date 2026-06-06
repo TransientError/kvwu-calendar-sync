@@ -263,3 +263,103 @@ class TestEdgeCases:
         del event["showAs"]
         result = filter_events([event], config)
         assert len(result) == 0  # empty string not in include_show_as
+
+
+# ─── ICS-mode realistic scenarios ───────────────────────────────────────────
+
+
+class TestICSModeScenarios:
+    """Tests simulating real ICS feed data where attendees are absent
+    and showAs (BUSYSTATUS) is the primary acceptance signal."""
+
+    def _ics_event(self, subject="Team Meeting", show_as="busy", is_cancelled=False):
+        """ICS events have no attendees, no organizer, response defaults to accepted."""
+        return {
+            "subject": subject,
+            "responseStatus": {"response": "accepted"},  # ICS adapter default
+            "showAs": show_as,
+            "isCancelled": is_cancelled,
+            "isOrganizer": False,  # ICS has no organizer data
+            "attendees": [],  # ICS strips attendees
+        }
+
+    def test_busy_event_passes(self):
+        config = _base_config(include_show_as=["busy"])
+        events = [self._ics_event(show_as="busy")]
+        assert len(filter_events(events, config)) == 1
+
+    def test_tentative_event_filtered(self):
+        config = _base_config(include_show_as=["busy"])
+        events = [self._ics_event(show_as="tentative")]
+        assert len(filter_events(events, config)) == 0
+
+    def test_free_event_filtered(self):
+        config = _base_config(include_show_as=["busy"])
+        events = [self._ics_event(show_as="free")]
+        assert len(filter_events(events, config)) == 0
+
+    def test_on_call_tentative_bypasses(self):
+        """On-call events are TENTATIVE in ICS but should always sync."""
+        config = _base_config(include_show_as=["busy"])
+        events = [self._ics_event(subject="Primary on-call schedule", show_as="tentative")]
+        assert len(filter_events(events, config)) == 1
+
+    def test_cancelled_prefix_in_subject(self):
+        """ICS events with 'Canceled:' subject are marked isCancelled by adapter."""
+        config = _base_config(include_show_as=["busy"])
+        events = [self._ics_event(subject="Canceled: Prism Standup", is_cancelled=True)]
+        assert len(filter_events(events, config)) == 0
+
+    def test_solo_detection_noop_in_ics(self):
+        """ICS events have isOrganizer=False, so solo detection never triggers."""
+        config = _base_config(include_show_as=["busy"])
+        events = [self._ics_event(show_as="busy")]
+        # attendees=[] but isOrganizer=False → not solo
+        assert len(filter_events(events, config)) == 1
+
+    def test_mixed_ics_feed(self):
+        """Simulate a typical ICS feed with various BUSYSTATUS values."""
+        config = _base_config(include_show_as=["busy"])
+        events = [
+            self._ics_event(subject="Accepted Meeting", show_as="busy"),
+            self._ics_event(subject="Tentative Meeting", show_as="tentative"),
+            self._ics_event(subject="Declined Meeting", show_as="free"),
+            self._ics_event(subject="Backup on-call rotation", show_as="tentative"),
+            self._ics_event(subject="Drive", show_as="busy"),
+            self._ics_event(subject="MCAPS Start: Day 1", show_as="busy"),
+        ]
+        result = filter_events(events, config)
+        subjects = [e["subject"] for e in result]
+        assert "Accepted Meeting" in subjects
+        assert "Backup on-call rotation" in subjects
+        assert "Tentative Meeting" not in subjects
+        assert "Declined Meeting" not in subjects
+        assert "Drive" not in subjects
+        assert "MCAPS Start: Day 1" not in subjects
+
+
+# ─── Pattern edge cases ─────────────────────────────────────────────────────
+
+
+class TestPatternEdgeCases:
+    def test_empty_always_sync_pattern_not_universal_match(self):
+        """Empty string in always_sync_subjects would match everything — guard against it."""
+        config = _base_config(always_sync_subjects=["", "on-call"], include_show_as=["busy"])
+        events = [_event(subject="Random meeting", show_as="free")]
+        # Empty string IS a substring of everything — this documents the foot-gun
+        result = filter_events(events, config)
+        assert len(result) == 1  # Bug: empty pattern bypasses all filters
+
+    def test_empty_skip_pattern_skips_everything(self):
+        """Empty string in skip_subject_patterns matches everything."""
+        config = _base_config(skip_subject_patterns=[""], include_show_as=["busy"])
+        events = [_event(subject="Important meeting", show_as="busy")]
+        result = filter_events(events, config)
+        assert len(result) == 0  # Bug: everything gets skipped
+
+    def test_whitespace_in_subject_exact_match(self):
+        """Trailing whitespace in subject won't match exact skip list."""
+        config = _base_config(skip_subjects=["drive"], include_show_as=["busy"])
+        events = [_event(subject="Drive ", show_as="busy")]
+        # "drive " != "drive" — trailing space prevents exact match
+        assert len(filter_events(events, config)) == 1
