@@ -336,7 +336,7 @@ def _expand_rrule_events(component, user_email: str, window_start: datetime, win
 
     try:
         if is_all_day:
-            rule = rrulestr(rrule_str, dtstart=datetime(dtstart.year, dtstart.month, dtstart.day))
+            rule = rrulestr(rrule_str, dtstart=datetime(dtstart.year, dtstart.month, dtstart.day, tzinfo=timezone.utc))
         else:
             if dtstart.tzinfo is None:
                 dtstart = dtstart.replace(tzinfo=timezone.utc)
