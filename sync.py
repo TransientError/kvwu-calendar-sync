@@ -20,6 +20,7 @@ import tomllib
 import httpx
 import msal
 import icalendar
+from dateutil.rrule import rrulestr
 from filelock import FileLock, Timeout
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from google.oauth2.credentials import Credentials
@@ -282,29 +283,181 @@ def fetch_ics_events(config: dict) -> list[dict]:
     raw = _fetch_ics()
     cal = icalendar.Calendar.from_ical(raw)
     events = []
+    # Track which expanded instances exist (to avoid duplicates with RRULE expansion)
+    seen_ids = set()
 
     for component in cal.walk():
         if component.name != "VEVENT":
             continue
 
-        event = _ics_vevent_to_dict(component, user_email)
-        if event is None:
-            continue
+        rrule = component.get("RRULE")
+        if rrule:
+            # Expand recurring events into the sync window
+            expanded = _expand_rrule_events(component, user_email, now, end)
+            for event in expanded:
+                if event["id"] not in seen_ids:
+                    seen_ids.add(event["id"])
+                    events.append(event)
+        else:
+            event = _ics_vevent_to_dict(component, user_email)
+            if event is None:
+                continue
 
-        # Filter by sync window (overlap: event.end >= now AND event.start <= end)
-        ev_start = _parse_ics_datetime(component.get("DTSTART"))
-        ev_end = _parse_ics_datetime(component.get("DTEND"))
-        if ev_start is None:
-            continue
-        if ev_end and ev_end < now:
-            continue
-        if ev_start > end:
-            continue
+            # Filter by sync window
+            ev_start = _parse_ics_datetime(component.get("DTSTART"))
+            ev_end = _parse_ics_datetime(component.get("DTEND"))
+            if ev_start is None:
+                continue
+            if ev_end and ev_end < now:
+                continue
+            if ev_start > end:
+                continue
 
-        events.append(event)
+            if event["id"] not in seen_ids:
+                seen_ids.add(event["id"])
+                events.append(event)
 
     log.debug(f"ICS feed parsed: {len(events)} events in sync window")
     return events
+
+
+def _expand_rrule_events(component, user_email: str, window_start: datetime, window_end: datetime) -> list[dict]:
+    """Expand a recurring VEVENT into individual occurrences within the sync window."""
+    rrule_prop = component.get("RRULE")
+    dtstart_prop = component.get("DTSTART")
+    if not dtstart_prop or not rrule_prop:
+        return []
+
+    dtstart = dtstart_prop.dt
+    is_all_day = not isinstance(dtstart, datetime)
+
+    # Build rrule string
+    rrule_str = rrule_prop.to_ical().decode()
+
+    try:
+        if is_all_day:
+            rule = rrulestr(rrule_str, dtstart=datetime(dtstart.year, dtstart.month, dtstart.day))
+        else:
+            if dtstart.tzinfo is None:
+                dtstart = dtstart.replace(tzinfo=timezone.utc)
+            rule = rrulestr(rrule_str, dtstart=dtstart)
+    except (ValueError, TypeError) as e:
+        log.debug(f"Failed to parse RRULE for {component.get('SUMMARY', '?')}: {e}")
+        return []
+
+    # Calculate event duration
+    dtend_prop = component.get("DTEND")
+    if dtend_prop:
+        dtend = dtend_prop.dt
+        if is_all_day:
+            duration = timedelta(days=(dtend - dtstart).days)
+        else:
+            if isinstance(dtend, datetime):
+                if dtend.tzinfo is None:
+                    dtend = dtend.replace(tzinfo=timezone.utc)
+                duration = dtend - dtstart
+            else:
+                duration = timedelta(hours=1)
+    else:
+        duration = timedelta(hours=1)
+
+    # Get EXDATE exclusions
+    exdates = set()
+    exdate_prop = component.get("EXDATE")
+    if exdate_prop:
+        if not isinstance(exdate_prop, list):
+            exdate_prop = [exdate_prop]
+        for exd in exdate_prop:
+            if hasattr(exd, 'dts'):
+                for dt_item in exd.dts:
+                    exdates.add(dt_item.dt)
+
+    # Expand occurrences in window
+    # Use a slightly earlier start to catch events that started before window but are still relevant
+    try:
+        occurrences = list(rule.between(window_start - timedelta(days=1), window_end, inc=True))
+    except Exception as e:
+        log.debug(f"RRULE expansion failed for {component.get('SUMMARY', '?')}: {e}")
+        return []
+
+    events = []
+    for occ_start in occurrences:
+        if occ_start in exdates:
+            continue
+
+        # Make timezone-aware
+        if not is_all_day and occ_start.tzinfo is None:
+            occ_start = occ_start.replace(tzinfo=dtstart.tzinfo or timezone.utc)
+
+        occ_end = occ_start + duration
+
+        # Check it's actually in the window
+        if is_all_day:
+            occ_start_utc = datetime(occ_start.year, occ_start.month, occ_start.day, tzinfo=timezone.utc)
+        else:
+            occ_start_utc = occ_start if occ_start.tzinfo else occ_start.replace(tzinfo=timezone.utc)
+
+        if occ_start_utc > window_end:
+            continue
+        occ_end_utc = occ_start_utc + duration
+        if occ_end_utc < window_start:
+            continue
+
+        # Build event dict for this occurrence
+        event = _build_occurrence_dict(component, user_email, occ_start, occ_end, is_all_day)
+        if event:
+            events.append(event)
+
+    return events
+
+
+def _build_occurrence_dict(component, user_email: str, occ_start, occ_end, is_all_day: bool) -> dict | None:
+    """Build a Graph-like event dict for a single RRULE occurrence."""
+    uid = str(component.get("UID", ""))
+    if not uid:
+        return None
+
+    event_id = f"{uid}_{occ_start.isoformat()}"
+    subject = str(component.get("SUMMARY", ""))
+    location = str(component.get("LOCATION", ""))
+    status = str(component.get("STATUS", "")).upper()
+
+    # Build start/end dicts
+    if is_all_day:
+        start_dict = {"dateTime": occ_start.strftime("%Y-%m-%d"), "timeZone": "UTC"}
+        end_dict = {"dateTime": occ_end.strftime("%Y-%m-%d"), "timeZone": "UTC"}
+    else:
+        tz_name = "UTC"
+        if occ_start.tzinfo:
+            tz_str = str(occ_start.tzinfo)
+            if "/" in tz_str:
+                tz_name = tz_str
+        start_dict = {"dateTime": occ_start.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": tz_name}
+        end_dict = {"dateTime": occ_end.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": tz_name}
+
+    # showAs from BUSYSTATUS
+    busy_status = str(component.get("X-MICROSOFT-CDO-BUSYSTATUS", "")).lower()
+    show_as_map = {"free": "free", "tentative": "tentative", "busy": "busy",
+                   "oof": "oof", "workingelsewhere": "workingElsewhere"}
+    show_as = show_as_map.get(busy_status, "busy")
+
+    # Response status
+    response_status = _get_user_response_status(component, user_email)
+
+    return {
+        "id": event_id,
+        "subject": subject,
+        "start": start_dict,
+        "end": end_dict,
+        "isAllDay": is_all_day,
+        "isCancelled": status == "CANCELLED" or subject.lower().startswith("canceled:"),
+        "responseStatus": {"response": response_status},
+        "location": {"displayName": location},
+        "showAs": show_as,
+        "organizer": {"emailAddress": {"address": ""}},
+        "attendees": [],
+        "isOrganizer": False,
+    }
 
 
 def _parse_ics_datetime(prop) -> datetime | None:
