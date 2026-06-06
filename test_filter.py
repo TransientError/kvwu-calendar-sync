@@ -68,8 +68,10 @@ class TestResponseStatusFilter:
 class TestShowAsFilter:
     def test_busy_passes_when_configured(self):
         config = _base_config(include_show_as=["busy"])
-        events = [_event(show_as="busy")]
-        assert len(filter_events(events, config)) == 1
+        events = [_event(subject="Busy", show_as="busy"), _event(subject="Free", show_as="free")]
+        result = filter_events(events, config)
+        assert len(result) == 1
+        assert result[0]["subject"] == "Busy"
 
     def test_tentative_filtered_when_busy_only(self):
         config = _base_config(include_show_as=["busy"])
@@ -207,15 +209,32 @@ class TestSoloEvents:
     """Solo detection only works in Graph API mode.
     In ICS mode, use skip_subjects for personal blocks instead."""
 
-    def test_solo_event_with_skip_disabled(self):
-        config = _base_config(skip_solo_events=False)
-        events = [_event(is_organizer=True, attendees=[])]
-        assert len(filter_events(events, config)) == 1
+    def test_solo_event_filtered_when_enabled(self):
+        """Organizer with no attendees is skipped when skip_solo_events=True."""
+        solo = _event(is_organizer=True, attendees=[])
+        non_solo = _event(subject="Team Meeting", is_organizer=True,
+                          attendees=[{"emailAddress": {"address": "a@b.com"}}])
+        config = _base_config()
+        result = filter_events([solo, non_solo], config)
+        assert len(result) == 1
+        assert result[0]["subject"] == "Team Meeting"
+
+    def test_solo_event_passes_when_disabled(self):
+        """Same solo event passes when skip_solo_events=False."""
+        solo = _event(is_organizer=True, attendees=[])
+        assert len(filter_events([solo], _base_config(skip_solo_events=False))) == 1
+        assert len(filter_events([solo], _base_config(skip_solo_events=True))) == 0
 
     def test_organizer_with_attendees_not_solo(self):
-        config = _base_config()
-        events = [_event(is_organizer=True, attendees=[{"emailAddress": {"address": "a@b.com"}}])]
-        assert len(filter_events(events, config)) == 1
+        """Organizer with attendees is never considered solo."""
+        events = [
+            _event(subject="Solo", is_organizer=True, attendees=[]),
+            _event(subject="With attendees", is_organizer=True,
+                   attendees=[{"emailAddress": {"address": "a@b.com"}}]),
+        ]
+        result = filter_events(events, _base_config())
+        subjects = [e["subject"] for e in result]
+        assert subjects == ["With attendees"]
 
 
 # ─── _is_solo_event helper ──────────────────────────────────────────────────
@@ -311,19 +330,24 @@ class TestICSModeScenarios:
         assert len(filter_events(events, config)) == 0
 
     def test_solo_detection_noop_in_ics(self):
-        """ICS events have isOrganizer=False, so solo detection never triggers."""
+        """ICS events have isOrganizer=False, so solo detection never triggers,
+        but a true organizer+no-attendees event would be filtered."""
         config = _base_config(include_show_as=["busy"])
-        events = [self._ics_event(show_as="busy")]
-        # attendees=[] but isOrganizer=False → not solo
-        assert len(filter_events(events, config)) == 1
+        ics_event = self._ics_event(show_as="busy")
+        # Same shape but with isOrganizer=True would be filtered as solo
+        solo_event = {**self._ics_event(subject="Solo block", show_as="busy"), "isOrganizer": True}
+        result = filter_events([ics_event, solo_event], config)
+        subjects = [e["subject"] for e in result]
+        assert "Team Meeting" in subjects
+        assert "Solo block" not in subjects
 
     def test_mixed_ics_feed(self):
         """Simulate a typical ICS feed with various BUSYSTATUS values."""
         config = _base_config(include_show_as=["busy"])
         events = [
             self._ics_event(subject="Accepted Meeting", show_as="busy"),
-            self._ics_event(subject="Tentative Meeting", show_as="tentative"),
-            self._ics_event(subject="Declined Meeting", show_as="free"),
+            self._ics_event(subject="Not Yet Responded", show_as="tentative"),
+            self._ics_event(subject="Free/Declined", show_as="free"),
             self._ics_event(subject="Backup on-call rotation", show_as="tentative"),
             self._ics_event(subject="Drive", show_as="busy"),
             self._ics_event(subject="MCAPS Start: Day 1", show_as="busy"),
@@ -331,24 +355,25 @@ class TestICSModeScenarios:
         result = filter_events(events, config)
         subjects = [e["subject"] for e in result]
         assert "Accepted Meeting" in subjects
-        assert "Backup on-call rotation" in subjects
-        assert "Tentative Meeting" not in subjects
-        assert "Declined Meeting" not in subjects
-        assert "Drive" not in subjects
-        assert "MCAPS Start: Day 1" not in subjects
+        assert "Backup on-call rotation" in subjects  # always_sync bypass
+        assert "Not Yet Responded" not in subjects  # showAs=tentative
+        assert "Free/Declined" not in subjects  # showAs=free
+        assert "Drive" not in subjects  # skip_subjects
+        assert "MCAPS Start: Day 1" not in subjects  # skip_subject_patterns
 
 
 # ─── Pattern edge cases ─────────────────────────────────────────────────────
 
 
 class TestPatternEdgeCases:
-    def test_empty_always_sync_pattern_not_universal_match(self):
-        """Empty string in always_sync_subjects would match everything — guard against it."""
+    def test_empty_always_sync_pattern_matches_everything(self):
+        """FOOT-GUN: empty string in always_sync_subjects matches all subjects.
+        This documents current behavior — consider stripping empty patterns."""
         config = _base_config(always_sync_subjects=["", "on-call"], include_show_as=["busy"])
-        events = [_event(subject="Random meeting", show_as="free")]
-        # Empty string IS a substring of everything — this documents the foot-gun
+        events = [_event(subject="Random meeting", response="declined", show_as="free")]
         result = filter_events(events, config)
-        assert len(result) == 1  # Bug: empty pattern bypasses all filters
+        # Empty string "" is a substring of every string, so bypass_status=True
+        assert len(result) == 1
 
     def test_empty_skip_pattern_skips_everything(self):
         """Empty string in skip_subject_patterns matches everything."""
