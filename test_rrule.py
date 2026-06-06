@@ -225,6 +225,7 @@ class TestEventIds:
         vevent = _make_vevent(rrule={"FREQ": ["WEEKLY"], "BYDAY": ["MO"]})
         start, end = _window(date(2026, 6, 1), date(2026, 6, 21))
         events = _expand_rrule_events(vevent, USER_EMAIL, start, end)
+        assert len(events) == 3  # Jun 1, 8, 15
         ids = [e["id"] for e in events]
         assert len(ids) == len(set(ids))
 
@@ -268,6 +269,7 @@ class TestMetadataPassthrough:
         vevent = _make_vevent(summary="Prism Quick Standup", rrule={"FREQ": ["WEEKLY"], "BYDAY": ["TU", "WE", "TH"]})
         start, end = _window(date(2026, 6, 2), date(2026, 6, 5))
         events = _expand_rrule_events(vevent, USER_EMAIL, start, end)
+        assert len(events) == 3
         for ev in events:
             assert ev["subject"] == "Prism Quick Standup"
 
@@ -326,6 +328,7 @@ class TestDSTTransitions:
         )
         start, end = _window(date(2026, 10, 5), date(2026, 11, 16))
         events = _expand_rrule_events(vevent, USER_EMAIL, start, end)
+        assert len(events) >= 6
         for ev in events:
             assert ev["start"]["timeZone"] == "America/Los_Angeles"
 
