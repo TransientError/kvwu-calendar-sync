@@ -19,6 +19,7 @@ import tomllib
 
 import httpx
 import msal
+import icalendar
 from filelock import FileLock, Timeout
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from google.oauth2.credentials import Credentials
@@ -38,6 +39,19 @@ GOOGLE_TOKEN_PATH = BASE_DIR / "google_token.json"
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+# X-MICROSOFT-CDO-BUSYSTATUS values in published ICS feeds.
+# In ICS mode (no Graph API), this is the primary signal for response status:
+#   BUSY             → accepted
+#   TENTATIVE        → not yet responded / tentatively accepted
+#   FREE             → declined or informational
+#   OOF              → user's own out-of-office
+#   WORKINGELSEWHERE → accepted but working remotely
+ICS_BUSYSTATUS_ACCEPTED = "busy"
+ICS_BUSYSTATUS_TENTATIVE = "tentative"
+ICS_BUSYSTATUS_DECLINED = "free"
+ICS_BUSYSTATUS_OOF = "oof"
+ICS_BUSYSTATUS_REMOTE = "workingElsewhere"
 
 # Google Calendar color name → ID mapping
 GOOGLE_COLORS = {
@@ -195,7 +209,9 @@ def get_google_service(config: dict, headless: bool = False):
                 str(creds_path), GOOGLE_SCOPES
             )
             if headless:
-                creds = flow.run_console()
+                # run_console was removed; use run_local_server with prompt-based redirect
+                flow.run_local_server(port=8401, open_browser=False)
+                creds = flow.credentials
             else:
                 creds = flow.run_local_server(port=8401)
 
@@ -245,6 +261,188 @@ def fetch_outlook_events(token: str, config: dict) -> list[dict]:
     return events
 
 
+# ─── ICS Feed Fetching ───────────────────────────────────────────────────────
+
+
+def fetch_ics_events(config: dict) -> list[dict]:
+    """Fetch calendar events from a published ICS feed URL."""
+    ics_url = config["sync"]["ics_url"]
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(days=config["sync"]["lookahead_days"])
+    user_email = config["sync"].get("user_email", "").lower()
+
+    retry_kwargs = _retry_config(config)
+
+    @retry(**retry_kwargs)
+    def _fetch_ics():
+        resp = httpx.get(ics_url, timeout=60, follow_redirects=True)
+        resp.raise_for_status()
+        return resp.content
+
+    raw = _fetch_ics()
+    cal = icalendar.Calendar.from_ical(raw)
+    events = []
+
+    for component in cal.walk():
+        if component.name != "VEVENT":
+            continue
+
+        event = _ics_vevent_to_dict(component, user_email)
+        if event is None:
+            continue
+
+        # Filter by sync window (overlap: event.end >= now AND event.start <= end)
+        ev_start = _parse_ics_datetime(component.get("DTSTART"))
+        ev_end = _parse_ics_datetime(component.get("DTEND"))
+        if ev_start is None:
+            continue
+        if ev_end and ev_end < now:
+            continue
+        if ev_start > end:
+            continue
+
+        events.append(event)
+
+    log.debug(f"ICS feed parsed: {len(events)} events in sync window")
+    return events
+
+
+def _parse_ics_datetime(prop) -> datetime | None:
+    """Extract a timezone-aware datetime from an icalendar property."""
+    if prop is None:
+        return None
+    dt = prop.dt
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+    # date (all-day) — treat as start of day UTC
+    return datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+
+
+def _ics_vevent_to_dict(component, user_email: str) -> dict | None:
+    """Convert an icalendar VEVENT to the same dict shape as Graph API events."""
+    uid = str(component.get("UID", ""))
+    if not uid:
+        return None
+
+    # Build a unique ID: UID + RECURRENCE-ID (if present) or UID + DTSTART
+    recurrence_id = component.get("RECURRENCE-ID")
+    if recurrence_id:
+        event_id = f"{uid}_{recurrence_id.dt.isoformat()}"
+    else:
+        dtstart = component.get("DTSTART")
+        if dtstart:
+            event_id = f"{uid}_{dtstart.dt.isoformat()}"
+        else:
+            event_id = uid
+
+    subject = str(component.get("SUMMARY", ""))
+    location = str(component.get("LOCATION", ""))
+    status = str(component.get("STATUS", "")).upper()
+
+    # Determine if all-day
+    dtstart_prop = component.get("DTSTART")
+    dtend_prop = component.get("DTEND")
+    is_all_day = False
+    if dtstart_prop:
+        from datetime import date as date_type
+        is_all_day = not isinstance(dtstart_prop.dt, datetime)
+
+    # Build start/end in Graph-like format
+    start_dict = _ics_dt_to_graph_format(dtstart_prop)
+    end_dict = _ics_dt_to_graph_format(dtend_prop)
+    if not start_dict:
+        return None
+
+    # Response status: find user's PARTSTAT from attendees
+    response_status = _get_user_response_status(component, user_email)
+
+    # showAs from X-MICROSOFT-CDO-BUSYSTATUS
+    busy_status = str(component.get("X-MICROSOFT-CDO-BUSYSTATUS", "")).lower()
+    show_as_map = {"free": "free", "tentative": "tentative", "busy": "busy",
+                   "oof": "oof", "workingelsewhere": "workingElsewhere"}
+    show_as = show_as_map.get(busy_status, "busy")
+
+    # Organizer and attendees
+    organizer_prop = component.get("ORGANIZER")
+    organizer_email = ""
+    if organizer_prop:
+        organizer_email = str(organizer_prop).replace("mailto:", "").replace("MAILTO:", "").lower()
+
+    is_organizer = (user_email and organizer_email == user_email)
+
+    attendees = []
+    attendee_props = component.get("ATTENDEE")
+    if attendee_props:
+        if not isinstance(attendee_props, list):
+            attendee_props = [attendee_props]
+        for att in attendee_props:
+            att_email = str(att).replace("mailto:", "").replace("MAILTO:", "").lower()
+            if att_email != user_email:
+                attendees.append({"emailAddress": {"address": att_email}})
+
+    return {
+        "id": event_id,
+        "subject": subject,
+        "start": start_dict,
+        "end": end_dict or start_dict,
+        "isAllDay": is_all_day,
+        "isCancelled": status == "CANCELLED" or subject.lower().startswith("canceled:"),
+        "responseStatus": {"response": response_status},
+        "location": {"displayName": location},
+        "showAs": show_as,
+        "organizer": {"emailAddress": {"address": organizer_email}},
+        "attendees": attendees,
+        "isOrganizer": is_organizer,
+    }
+
+
+def _ics_dt_to_graph_format(prop) -> dict | None:
+    """Convert icalendar datetime prop to Graph-like {dateTime, timeZone} dict."""
+    if prop is None:
+        return None
+    dt = prop.dt
+    if isinstance(dt, datetime):
+        # Use the parsed tzinfo (IANA name) rather than the TZID param (may be Windows name)
+        tz_name = "UTC"
+        if dt.tzinfo:
+            tz_str = str(dt.tzinfo)
+            # Only use if it looks like an IANA timezone (contains '/')
+            if "/" in tz_str:
+                tz_name = tz_str
+        return {"dateTime": dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": tz_name}
+    # date (all-day)
+    return {"dateTime": dt.isoformat(), "timeZone": "UTC"}
+
+
+def _get_user_response_status(component, user_email: str) -> str:
+    """Extract the user's response status from VEVENT attendees."""
+    if not user_email:
+        return "accepted"  # Default to accepted if no user email configured
+
+    attendee_props = component.get("ATTENDEE")
+    if not attendee_props:
+        return "accepted"
+    if not isinstance(attendee_props, list):
+        attendee_props = [attendee_props]
+
+    partstat_map = {
+        "ACCEPTED": "accepted",
+        "TENTATIVE": "tentativelyAccepted",
+        "DECLINED": "declined",
+        "NEEDS-ACTION": "notResponded",
+    }
+
+    for att in attendee_props:
+        att_email = str(att).replace("mailto:", "").replace("MAILTO:", "").lower()
+        if att_email == user_email:
+            partstat = str(att.params.get("PARTSTAT", "NEEDS-ACTION")).upper()
+            return partstat_map.get(partstat, "notResponded")
+
+    return "accepted"  # User not in attendee list — likely organizer
+
+
 def filter_events(events: list[dict], config: dict) -> list[dict]:
     """Filter events by response status and optionally by showAs.
 
@@ -257,6 +455,8 @@ def filter_events(events: list[dict], config: dict) -> list[dict]:
         include_show_as = set(include_show_as)
 
     always_sync_patterns = [p.lower() for p in config["sync"].get("always_sync_subjects", [])]
+    skip_subjects = [s.lower() for s in config["sync"].get("skip_subjects", [])]
+    skip_subject_patterns = [p.lower() for p in config["sync"].get("skip_subject_patterns", [])]
     skip_solo = config["sync"].get("skip_solo_events", True)
 
     filtered = []
@@ -270,6 +470,17 @@ def filter_events(events: list[dict], config: dict) -> list[dict]:
             continue
 
         subject = event.get("subject", "").lower()
+
+        # Skip events whose subject exactly matches the skip list
+        if subject in skip_subjects:
+            log.debug(f"Skipping by subject: {event.get('subject', 'No subject')}")
+            continue
+
+        # Skip events matching skip patterns (substring match)
+        if any(pattern in subject for pattern in skip_subject_patterns):
+            log.debug(f"Skipping by pattern: {event.get('subject', 'No subject')}")
+            continue
+
         bypass_status = any(pattern in subject for pattern in always_sync_patterns)
 
         if not bypass_status:
@@ -277,8 +488,8 @@ def filter_events(events: list[dict], config: dict) -> list[dict]:
             if status not in include_statuses:
                 continue
 
-        if include_show_as and event.get("showAs", "").lower() not in include_show_as:
-            continue
+            if include_show_as and event.get("showAs", "").lower() not in include_show_as:
+                continue
         filtered.append(event)
     return filtered
 
@@ -426,11 +637,19 @@ def _build_google_event(event: dict, color: str) -> dict:
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
+def _use_ics_source(config: dict) -> bool:
+    """Check if ICS feed is configured as the event source."""
+    return bool(config.get("sync", {}).get("ics_url"))
+
+
 def run_auth(config: dict, headless: bool = False):
-    """Run interactive auth flows for both services."""
-    log.info("Authenticating with Microsoft...")
-    get_ms_token(config)
-    log.info("Microsoft auth successful!")
+    """Run interactive auth flows for configured services."""
+    if not _use_ics_source(config):
+        log.info("Authenticating with Microsoft...")
+        get_ms_token(config)
+        log.info("Microsoft auth successful!")
+    else:
+        log.info("Using ICS feed — no Microsoft auth needed.")
 
     log.info("Authenticating with Google...")
     get_google_service(config, headless=headless)
@@ -443,9 +662,13 @@ def run_sync(config: dict):
     """Run a single sync cycle."""
     log.info("Starting sync...")
 
-    token = get_ms_token(config)
-    events = fetch_outlook_events(token, config)
-    log.info(f"Fetched {len(events)} events from Outlook")
+    if _use_ics_source(config):
+        events = fetch_ics_events(config)
+        log.info(f"Fetched {len(events)} events from ICS feed")
+    else:
+        token = get_ms_token(config)
+        events = fetch_outlook_events(token, config)
+        log.info(f"Fetched {len(events)} events from Outlook")
 
     filtered = filter_events(events, config)
     log.info(f"After filtering: {len(filtered)} events")
@@ -505,8 +728,11 @@ def main():
     try:
         with lock:
             if args.dry_run:
-                token = get_ms_token(config)
-                events = fetch_outlook_events(token, config)
+                if _use_ics_source(config):
+                    events = fetch_ics_events(config)
+                else:
+                    token = get_ms_token(config)
+                    events = fetch_outlook_events(token, config)
                 filtered = filter_events(events, config)
                 log.info(f"Would sync {len(filtered)} events:")
                 for e in filtered:

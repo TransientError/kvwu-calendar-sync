@@ -6,6 +6,15 @@ tenant_id = "YOUR_AZURE_TENANT_ID"
 credentials_file = "credentials.json"
 
 [sync]
+# Event source: set ics_url to use a published ICS feed (no Azure app needed).
+# Leave blank to use Microsoft Graph API (requires [microsoft] section).
+# In ICS mode, X-MICROSOFT-CDO-BUSYSTATUS is used to determine acceptance:
+#   BUSY = accepted, TENTATIVE = not responded, FREE = declined, OOF = out of office
+ics_url = ""
+
+# Your work email (needed for ICS mode to determine your response status)
+user_email = ""
+
 # How many days ahead to sync
 lookahead_days = 180
 
@@ -13,15 +22,24 @@ lookahead_days = 180
 # "declined" is excluded by default
 include_statuses = ["accepted"]
 
-# Subjects that always sync regardless of response status (case-insensitive substring match).
+# Subjects that always sync regardless of response status or showAs filter
+# (case-insensitive substring match).
 # Useful for on-call schedules you haven't accepted yet but need visibility on.
 always_sync_subjects = ["on-call"]
+
+# Exact subjects to always skip (case-insensitive exact match)
+skip_subjects = ["Drive", "Drive home", "Lunch"]
+
+# Subject patterns to skip (case-insensitive substring match)
+skip_subject_patterns = []
 
 # Skip events you created for yourself with no other attendees (time blocks, commute, lunch).
 skip_solo_events = true
 
 # Which showAs values to include (empty = all): "busy", "tentative", "free", "oof", "workingElsewhere"
-# include_show_as = ["busy", "oof", "workingElsewhere"]
+# In ICS mode, this maps to X-MICROSOFT-CDO-BUSYSTATUS.
+# Set to ["busy"] to only sync accepted events.
+# include_show_as = ["busy"]
 
 # How often the sync runs (informational, actual schedule is via cron)
 poll_interval_minutes = 5
